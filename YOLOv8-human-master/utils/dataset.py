@@ -197,7 +197,7 @@ class Dataset(data.Dataset):
 
     @staticmethod
     def load_label(filenames):
-        path = f"/kaggle/working/{filename[0]}.cache"
+        path = f'{os.path.dirname(filenames[0])}.cache'
         if os.path.exists(path):
             return torch.load(path)
         x = {}
