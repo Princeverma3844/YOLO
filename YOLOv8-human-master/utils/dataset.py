@@ -216,6 +216,7 @@ class Dataset(data.Dataset):
                 b = f'{os.sep}labels{os.sep}'
                 if os.path.isfile(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt'):
                     print(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt')
+                    break
                     with open(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt') as f:
                         label = [x.split() for x in f.read().strip().splitlines() if len(x)]
                         label = numpy.array(label, dtype=numpy.float32)
