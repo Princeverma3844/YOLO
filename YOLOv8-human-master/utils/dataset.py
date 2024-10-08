@@ -25,7 +25,7 @@ class Dataset(data.Dataset):
         self.n = len(self.filenames)  # number of samples
         self.indices = range(self.n)
         # Albumentations (optional, only used if package is installed)
-        # self.albumentations = Albumentations()
+        self.albumentations = Albumentations()
 
     def __getitem__(self, index):
         index = self.indices[index]
