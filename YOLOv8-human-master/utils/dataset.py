@@ -236,7 +236,7 @@ class Dataset(data.Dataset):
                 pass
             except AssertionError:
                 pass
-        torch.save(x, path)
+        # torch.save(x, path)
         return x
 
 
