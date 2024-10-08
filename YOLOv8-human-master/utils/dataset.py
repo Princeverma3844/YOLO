@@ -52,6 +52,7 @@ class Dataset(data.Dataset):
             image, ratio, pad = resize(image, self.input_size, self.augment)
 
             label = self.labels[index].copy()
+            print(label)
             if label.size:
                 label[:, 1:] = wh2xy(label[:, 1:], ratio[0] * w, ratio[1] * h, pad[0], pad[1])
             if self.augment:
@@ -89,6 +90,7 @@ class Dataset(data.Dataset):
         # Convert HWC to CHW, BGR to RGB
         sample = image.transpose((2, 0, 1))[::-1]
         sample = numpy.ascontiguousarray(sample)
+        print(target_cls, target_box)
 
         return torch.from_numpy(sample), target_cls, target_box, torch.zeros(nl)
 
@@ -214,10 +216,8 @@ class Dataset(data.Dataset):
                 # verify labels
                 a = f'{os.sep}images{os.sep}'
                 b = f'{os.sep}labels{os.sep}'
-                print(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt')
                 if os.path.isfile(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt'):
                     with open(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt') as f:
-                        print(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt')
                         label = [x.split() for x in f.read().strip().splitlines() if len(x)]
                         label = numpy.array(label, dtype=numpy.float32)
                     nl = len(label)
