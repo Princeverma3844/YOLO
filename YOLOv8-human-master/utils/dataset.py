@@ -24,7 +24,6 @@ class Dataset(data.Dataset):
         self.filenames = list(labels.keys())  # update
         self.n = len(self.filenames)  # number of samples
         self.indices = range(self.n)
-        print("gone")
         # Albumentations (optional, only used if package is installed)
         # self.albumentations = Albumentations()
 
@@ -237,7 +236,7 @@ class Dataset(data.Dataset):
                 pass
             except AssertionError:
                 pass
-        # torch.save(x, path)
+        torch.save(x, path)
         return x
 
 
