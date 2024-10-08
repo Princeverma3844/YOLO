@@ -214,8 +214,10 @@ class Dataset(data.Dataset):
                 # verify labels
                 a = f'{os.sep}images{os.sep}'
                 b = f'{os.sep}labels{os.sep}'
+                print(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt')
                 if os.path.isfile(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt'):
                     with open(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt') as f:
+                        print(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt')
                         label = [x.split() for x in f.read().strip().splitlines() if len(x)]
                         label = numpy.array(label, dtype=numpy.float32)
                     nl = len(label)
