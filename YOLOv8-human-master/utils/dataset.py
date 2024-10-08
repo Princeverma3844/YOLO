@@ -29,6 +29,7 @@ class Dataset(data.Dataset):
 
     def __getitem__(self, index):
         index = self.indices[index]
+        print(index)
 
         params = self.params
         mosaic = self.mosaic and random.random() < params['mosaic']
