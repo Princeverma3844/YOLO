@@ -1,573 +1,418 @@
-import copy
 import math
+import os
 import random
-from time import time
 
+import cv2
 import numpy
 import torch
-import torchvision
-from torch.nn.functional import cross_entropy
+from PIL import Image
+from torch.utils import data
+
+FORMATS = 'bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp'
 
 
-def setup_seed():
-    """
-    Setup random seed.
-    """
-    random.seed(0)
-    numpy.random.seed(0)
-    torch.manual_seed(0)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+class Dataset(data.Dataset):
+    def __init__(self, filenames, input_size, params, augment):
+        self.params = params
+        self.mosaic = augment
+        self.augment = augment
+        self.input_size = input_size
+
+        # Read labels
+        labels = self.load_label(filenames)
+        self.labels = list(labels.values())
+        self.filenames = list(labels.keys())  # update
+        self.n = len(self.filenames)  # number of samples
+        self.indices = range(self.n)
+        # Albumentations (optional, only used if package is installed)
+        self.albumentations = Albumentations()
+
+    def __getitem__(self, index):
+        index = self.indices[index]
+
+        params = self.params
+        mosaic = self.mosaic and random.random() < params['mosaic']
+
+        if mosaic:
+            # Load MOSAIC
+            image, label = self.load_mosaic(index, params)
+            # MixUp augmentation
+            if random.random() < params['mix_up']:
+                index = random.choice(self.indices)
+                mix_image1, mix_label1 = image, label
+                mix_image2, mix_label2 = self.load_mosaic(index, params)
+
+                image, label = mix_up(mix_image1, mix_label1, mix_image2, mix_label2)
+        else:
+            # Load image
+            image, shape = self.load_image(index)
+            h, w = image.shape[:2]
+
+            # Resize
+            image, ratio, pad = resize(image, self.input_size, self.augment)
+
+            label = self.labels[index].copy()
+            if label.size:
+                label[:, 1:] = wh2xy(label[:, 1:], ratio[0] * w, ratio[1] * h, pad[0], pad[1])
+            if self.augment:
+                image, label = random_perspective(image, label, params)
+
+        nl = len(label)  # number of labels
+        h, w = image.shape[:2]
+        cls = label[:, 0:1]
+        box = label[:, 1:5]
+        box = xy2wh(box, w, h)
+
+        if self.augment:
+            # Albumentations
+            image, box, cls = self.albumentations(image, box, cls)
+            nl = len(box)  # update after albumentations
+            # HSV color-space
+            augment_hsv(image, params)
+            # Flip up-down
+            if random.random() < params['flip_ud']:
+                image = numpy.flipud(image)
+                if nl:
+                    box[:, 1] = 1 - box[:, 1]
+            # Flip left-right
+            if random.random() < params['flip_lr']:
+                image = numpy.fliplr(image)
+                if nl:
+                    box[:, 0] = 1 - box[:, 0]
+
+        target_cls = torch.zeros((nl, 1))
+        target_box = torch.zeros((nl, 4))
+        if nl:
+            target_cls = torch.from_numpy(cls)
+            target_box = torch.from_numpy(box)
+
+        # Convert HWC to CHW, BGR to RGB
+        sample = image.transpose((2, 0, 1))[::-1]
+        sample = numpy.ascontiguousarray(sample)
+
+        return torch.from_numpy(sample), target_cls, target_box, torch.zeros(nl)
+
+    def __len__(self):
+        return len(self.filenames)
+
+    def load_image(self, i):
+        image = cv2.imread(self.filenames[i])
+        h, w = image.shape[:2]
+        r = self.input_size / max(h, w)
+        if r != 1:
+            image = cv2.resize(image,
+                               dsize=(int(w * r), int(h * r)),
+                               interpolation=resample() if self.augment else cv2.INTER_LINEAR)
+        return image, (h, w)
+
+    def load_mosaic(self, index, params):
+        label4 = []
+        border = [-self.input_size // 2, -self.input_size // 2]
+        image4 = numpy.full((self.input_size * 2, self.input_size * 2, 3), 0, dtype=numpy.uint8)
+        y1a, y2a, x1a, x2a, y1b, y2b, x1b, x2b = (None, None, None, None, None, None, None, None)
+
+        xc = int(random.uniform(-border[0], 2 * self.input_size + border[1]))
+        yc = int(random.uniform(-border[0], 2 * self.input_size + border[1]))
+
+        indices = [index] + random.choices(self.indices, k=3)
+        random.shuffle(indices)
+
+        for i, index in enumerate(indices):
+            # Load image
+            image, _ = self.load_image(index)
+            shape = image.shape
+            if i == 0:  # top left
+                x1a = max(xc - shape[1], 0)
+                y1a = max(yc - shape[0], 0)
+                x2a = xc
+                y2a = yc
+                x1b = shape[1] - (x2a - x1a)
+                y1b = shape[0] - (y2a - y1a)
+                x2b = shape[1]
+                y2b = shape[0]
+            if i == 1:  # top right
+                x1a = xc
+                y1a = max(yc - shape[0], 0)
+                x2a = min(xc + shape[1], self.input_size * 2)
+                y2a = yc
+                x1b = 0
+                y1b = shape[0] - (y2a - y1a)
+                x2b = min(shape[1], x2a - x1a)
+                y2b = shape[0]
+            if i == 2:  # bottom left
+                x1a = max(xc - shape[1], 0)
+                y1a = yc
+                x2a = xc
+                y2a = min(self.input_size * 2, yc + shape[0])
+                x1b = shape[1] - (x2a - x1a)
+                y1b = 0
+                x2b = shape[1]
+                y2b = min(y2a - y1a, shape[0])
+            if i == 3:  # bottom right
+                x1a = xc
+                y1a = yc
+                x2a = min(xc + shape[1], self.input_size * 2)
+                y2a = min(self.input_size * 2, yc + shape[0])
+                x1b = 0
+                y1b = 0
+                x2b = min(shape[1], x2a - x1a)
+                y2b = min(y2a - y1a, shape[0])
+
+            pad_w = x1a - x1b
+            pad_h = y1a - y1b
+            image4[y1a:y2a, x1a:x2a] = image[y1b:y2b, x1b:x2b]
+
+            # Labels
+            label = self.labels[index].copy()
+            if len(label):
+                label[:, 1:] = wh2xy(label[:, 1:], shape[1], shape[0], pad_w, pad_h)
+            label4.append(label)
+
+        # Concat/clip labels
+        label4 = numpy.concatenate(label4, 0)
+        for x in label4[:, 1:]:
+            numpy.clip(x, 0, 2 * self.input_size, out=x)
+
+        # Augment
+        image4, label4 = random_perspective(image4, label4, params, border)
+
+        return image4, label4
+
+    @staticmethod
+    def collate_fn(batch):
+        samples, cls, box, indices = zip(*batch)
+
+        cls = torch.cat(cls, 0)
+        box = torch.cat(box, 0)
+
+        new_indices = list(indices)
+        for i in range(len(indices)):
+            new_indices[i] += i
+        indices = torch.cat(new_indices, 0)
+
+        targets = {'cls': cls,
+                   'box': box,
+                   'idx': indices}
+        return torch.stack(samples, 0), targets
+
+    @staticmethod
+    def load_label(filenames):
+        path = f'{os.path.dirname(filenames[0])}.cache'
+        if os.path.exists(path):
+            return torch.load(path)
+        x = {}
+        for filename in filenames:
+            try:
+                # verify images
+                with open(filename, 'rb') as f:
+                    image = Image.open(f)
+                    image.verify()  # PIL verify
+                shape = image.size  # image size
+                assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
+                assert image.format.lower() in FORMATS, f'invalid image format {image.format}'
+
+                # verify labels
+                a = f'{os.sep}images{os.sep}'
+                b = f'{os.sep}labels{os.sep}'
+                if os.path.isfile(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt'):
+                    with open(b.join(filename.rsplit(a, 1)).rsplit('.', 1)[0] + '.txt') as f:
+                        label = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                        label = numpy.array(label, dtype=numpy.float32)
+                    nl = len(label)
+                    if nl:
+                        assert (label >= 0).all()
+                        assert label.shape[1] == 5
+                        assert (label[:, 1:] <= 1).all()
+                        _, i = numpy.unique(label, axis=0, return_index=True)
+                        if len(i) < nl:  # duplicate row check
+                            label = label[i]  # remove duplicates
+                    else:
+                        label = numpy.zeros((0, 5), dtype=numpy.float32)
+                else:
+                    label = numpy.zeros((0, 5), dtype=numpy.float32)
+                if filename:
+                    x[filename] = label
+            except FileNotFoundError:
+                pass
+            except AssertionError:
+                pass
+        torch.save(x, path)
+        return x
 
 
-def setup_multi_processes():
-    """
-    Setup multi-processing environment variables.
-    """
-    import cv2
-    from os import environ
-    from platform import system
-
-    # set multiprocess start method as `fork` to speed up the training
-    if system() != 'Windows':
-        torch.multiprocessing.set_start_method('fork', force=True)
-
-    # disable opencv multithreading to avoid system being overloaded
-    cv2.setNumThreads(0)
-
-    # setup OMP threads
-    if 'OMP_NUM_THREADS' not in environ:
-        environ['OMP_NUM_THREADS'] = '1'
-
-    # setup MKL threads
-    if 'MKL_NUM_THREADS' not in environ:
-        environ['MKL_NUM_THREADS'] = '1'
-
-
-def export_onnx(args):
-    import onnx  # noqa
-
-    inputs = ['images']
-    outputs = ['outputs']
-    dynamic = {'outputs': {0: 'batch', 1: 'anchors'}}
-
-    m = torch.load('./weights/best.pt')['model'].float()
-    x = torch.zeros((1, 3, args.input_size, args.input_size))
-
-    torch.onnx.export(m.cpu(), x.cpu(),
-                      './weights/best.onnx',
-                      verbose=False,
-                      opset_version=12,
-                      # WARNING: DNN inference with torch>=1.12 may require do_constant_folding=False
-                      do_constant_folding=True,
-                      input_names=inputs,
-                      output_names=outputs,
-                      dynamic_axes=dynamic or None)
-
-    # Checks
-    model_onnx = onnx.load('./weights/best.onnx')  # load onnx model
-    onnx.checker.check_model(model_onnx)  # check onnx model
-
-    onnx.save(model_onnx, './weights/best.onnx')
-    # Inference example
-    # https://github.com/ultralytics/ultralytics/blob/main/ultralytics/nn/autobackend.py
-
-
-def wh2xy(x):
-    y = x.clone() if isinstance(x, torch.Tensor) else numpy.copy(x)
-    y[:, 0] = x[:, 0] - x[:, 2] / 2  # top left x
-    y[:, 1] = x[:, 1] - x[:, 3] / 2  # top left y
-    y[:, 2] = x[:, 0] + x[:, 2] / 2  # bottom right x
-    y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
+def wh2xy(x, w=640, h=640, pad_w=0, pad_h=0):
+    # Convert nx4 boxes
+    # from [x, y, w, h] normalized to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
+    y = numpy.copy(x)
+    y[:, 0] = w * (x[:, 0] - x[:, 2] / 2) + pad_w  # top left x
+    y[:, 1] = h * (x[:, 1] - x[:, 3] / 2) + pad_h  # top left y
+    y[:, 2] = w * (x[:, 0] + x[:, 2] / 2) + pad_w  # bottom right x
+    y[:, 3] = h * (x[:, 1] + x[:, 3] / 2) + pad_h  # bottom right y
     return y
 
 
-def make_anchors(x, strides, offset=0.5):
-    anchors, stride_tensor = [], []
-    for i, stride in enumerate(strides):
-        _, _, h, w = x[i].shape
-        sx = torch.arange(end=w, dtype=x[i].dtype, device=x[i].device) + offset  # shift x
-        sy = torch.arange(end=h, dtype=x[i].dtype, device=x[i].device) + offset  # shift y
-        sy, sx = torch.meshgrid(sy, sx)
-        anchors.append(torch.stack((sx, sy), -1).view(-1, 2))
-        stride_tensor.append(torch.full((h * w, 1), stride, dtype=x[i].dtype, device=x[i].device))
-    return torch.cat(anchors), torch.cat(stride_tensor)
+def xy2wh(x, w, h):
+    # warning: inplace clip
+    x[:, [0, 2]] = x[:, [0, 2]].clip(0, w - 1E-3)  # x1, x2
+    x[:, [1, 3]] = x[:, [1, 3]].clip(0, h - 1E-3)  # y1, y2
+
+    # Convert nx4 boxes
+    # from [x1, y1, x2, y2] to [x, y, w, h] normalized where xy1=top-left, xy2=bottom-right
+    y = numpy.copy(x)
+    y[:, 0] = ((x[:, 0] + x[:, 2]) / 2) / w  # x center
+    y[:, 1] = ((x[:, 1] + x[:, 3]) / 2) / h  # y center
+    y[:, 2] = (x[:, 2] - x[:, 0]) / w  # width
+    y[:, 3] = (x[:, 3] - x[:, 1]) / h  # height
+    return y
 
 
-def compute_metric(output, target, iou_v):
-    # intersection(N,M) = (rb(N,M,2) - lt(N,M,2)).clamp(0).prod(2)
-    (a1, a2) = target[:, 1:].unsqueeze(1).chunk(2, 2)
-    (b1, b2) = output[:, :4].unsqueeze(0).chunk(2, 2)
-    intersection = (torch.min(a2, b2) - torch.max(a1, b1)).clamp(0).prod(2)
-    # IoU = intersection / (area1 + area2 - intersection)
-    iou = intersection / ((a2 - a1).prod(2) + (b2 - b1).prod(2) - intersection + 1e-7)
-
-    correct = numpy.zeros((output.shape[0], iou_v.shape[0]))
-    correct = correct.astype(bool)
-    for i in range(len(iou_v)):
-        # IoU > threshold and classes match
-        x = torch.where((iou >= iou_v[i]) & (target[:, 0:1] == output[:, 5]))
-        if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1),
-                                 iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
-            if x[0].shape[0] > 1:
-                matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[numpy.unique(matches[:, 1], return_index=True)[1]]
-                matches = matches[numpy.unique(matches[:, 0], return_index=True)[1]]
-            correct[matches[:, 1].astype(int), i] = True
-    return torch.tensor(correct, dtype=torch.bool, device=output.device)
+def resample():
+    choices = (cv2.INTER_AREA,
+               cv2.INTER_CUBIC,
+               cv2.INTER_LINEAR,
+               cv2.INTER_NEAREST,
+               cv2.INTER_LANCZOS4)
+    return random.choice(seq=choices)
 
 
-def non_max_suppression(outputs, conf_threshold, iou_threshold):
-    max_wh = 7680
-    max_det = 300
-    max_nms = 30000
+def augment_hsv(image, params):
+    # HSV color-space augmentation
+    h = params['hsv_h']
+    s = params['hsv_s']
+    v = params['hsv_v']
 
-    bs = outputs.shape[0]  # batch size
-    nc = outputs.shape[1] - 4  # number of classes
-    xc = outputs[:, 4:4 + nc].amax(1) > conf_threshold  # candidates
+    r = numpy.random.uniform(-1, 1, 3) * [h, s, v] + 1
+    h, s, v = cv2.split(cv2.cvtColor(image, cv2.COLOR_BGR2HSV))
 
-    start = time()
-    limit = 0.5 + 0.05 * bs  # seconds to quit after
+    x = numpy.arange(0, 256, dtype=r.dtype)
+    lut_h = ((x * r[0]) % 180).astype('uint8')
+    lut_s = numpy.clip(x * r[1], 0, 255).astype('uint8')
+    lut_v = numpy.clip(x * r[2], 0, 255).astype('uint8')
 
-    output = [torch.zeros((0, 6), device=outputs.device)] * bs
-    for index, x in enumerate(outputs):  # image index, image inference
-        x = x.transpose(0, -1)[xc[index]]  # confidence
-
-        # If none remain process next image
-        if not x.shape[0]:
-            continue
-
-        box, cls = x.split((4, nc), 1)
-        box = wh2xy(box)  # (cx, cy, w, h) to (x1, y1, x2, y2)
-        if nc > 1:
-            i, j = (cls > conf_threshold).nonzero(as_tuple=False).T
-            x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float()), 1)
-        else:  # best class only
-            conf, j = cls.max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_threshold]
-
-        if not x.shape[0]:  # no boxes
-            continue
-        x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence and remove excess boxes
-
-        # Batched NMS
-        c = x[:, 5:6] * max_wh  # classes
-        boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
-        i = torchvision.ops.nms(boxes, scores, iou_threshold)  # NMS
-        i = i[:max_det]  # limit detections
-
-        output[index] = x[i]
-        if (time() - start) > limit:
-            break  # time limit exceeded
-
-    return output
+    hsv = cv2.merge((cv2.LUT(h, lut_h), cv2.LUT(s, lut_s), cv2.LUT(v, lut_v)))
+    cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR, dst=image)  # no return needed
 
 
-def smooth(y, f=0.05):
-    # Box filter of fraction f
-    nf = round(len(y) * f * 2) // 2 + 1  # number of filter elements (must be odd)
-    p = numpy.ones(nf // 2)  # ones padding
-    yp = numpy.concatenate((p * y[0], y, p * y[-1]), 0)  # y padded
-    return numpy.convolve(yp, numpy.ones(nf) / nf, mode='valid')  # y-smoothed
+def resize(image, input_size, augment):
+    # Resize and pad image while meeting stride-multiple constraints
+    shape = image.shape[:2]  # current shape [height, width]
+
+    # Scale ratio (new / old)
+    r = min(input_size / shape[0], input_size / shape[1])
+    if not augment:  # only scale down, do not scale up (for better val mAP)
+        r = min(r, 1.0)
+
+    # Compute padding
+    pad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    w = (input_size - pad[0]) / 2
+    h = (input_size - pad[1]) / 2
+
+    if shape[::-1] != pad:  # resize
+        image = cv2.resize(image,
+                           dsize=pad,
+                           interpolation=resample() if augment else cv2.INTER_LINEAR)
+    top, bottom = int(round(h - 0.1)), int(round(h + 0.1))
+    left, right = int(round(w - 0.1)), int(round(w + 0.1))
+    image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT)  # add border
+    return image, (r, r), (w, h)
 
 
-def compute_ap(tp, conf, pred_cls, target_cls, eps=1e-16):
-    """
-    Compute the average precision, given the recall and precision curves.
-    Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
-    # Arguments
-        tp:  True positives (nparray, nx1 or nx10).
-        conf:  Object-ness value from 0-1 (nparray).
-        pred_cls:  Predicted object classes (nparray).
-        target_cls:  True object classes (nparray).
-    # Returns
-        The average precision
-    """
-    # Sort by object-ness
-    i = numpy.argsort(-conf)
-    tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
-
-    # Find unique classes
-    unique_classes, nt = numpy.unique(target_cls, return_counts=True)
-    nc = unique_classes.shape[0]  # number of classes, number of detections
-
-    # Create Precision-Recall curve and compute AP for each class
-    p = numpy.zeros((nc, 1000))
-    r = numpy.zeros((nc, 1000))
-    ap = numpy.zeros((nc, tp.shape[1]))
-    px, py = numpy.linspace(0, 1, 1000), []  # for plotting
-    for ci, c in enumerate(unique_classes):
-        i = pred_cls == c
-        nl = nt[ci]  # number of labels
-        no = i.sum()  # number of outputs
-        if no == 0 or nl == 0:
-            continue
-
-        # Accumulate FPs and TPs
-        fpc = (1 - tp[i]).cumsum(0)
-        tpc = tp[i].cumsum(0)
-
-        # Recall
-        recall = tpc / (nl + eps)  # recall curve
-        # negative x, xp because xp decreases
-        r[ci] = numpy.interp(-px, -conf[i], recall[:, 0], left=0)
-
-        # Precision
-        precision = tpc / (tpc + fpc)  # precision curve
-        p[ci] = numpy.interp(-px, -conf[i], precision[:, 0], left=1)  # p at pr_score
-
-        # AP from recall-precision curve
-        for j in range(tp.shape[1]):
-            m_rec = numpy.concatenate(([0.0], recall[:, j], [1.0]))
-            m_pre = numpy.concatenate(([1.0], precision[:, j], [0.0]))
-
-            # Compute the precision envelope
-            m_pre = numpy.flip(numpy.maximum.accumulate(numpy.flip(m_pre)))
-
-            # Integrate area under curve
-            x = numpy.linspace(0, 1, 101)  # 101-point interp (COCO)
-            ap[ci, j] = numpy.trapz(numpy.interp(x, m_rec, m_pre), x)  # integrate
-
-    # Compute F1 (harmonic mean of precision and recall)
-    f1 = 2 * p * r / (p + r + eps)
-
-    i = smooth(f1.mean(0), 0.1).argmax()  # max F1 index
-    p, r, f1 = p[:, i], r[:, i], f1[:, i]
-    tp = (r * nt).round()  # true positives
-    fp = (tp / (p + eps) - tp).round()  # false positives
-    ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
-    m_pre, m_rec = p.mean(), r.mean()
-    map50, mean_ap = ap50.mean(), ap.mean()
-    return tp, fp, m_pre, m_rec, map50, mean_ap
+def candidates(box1, box2):
+    # box1(4,n), box2(4,n)
+    w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
+    w2, h2 = box2[2] - box2[0], box2[3] - box2[1]
+    aspect_ratio = numpy.maximum(w2 / (h2 + 1e-16), h2 / (w2 + 1e-16))  # aspect ratio
+    return (w2 > 2) & (h2 > 2) & (w2 * h2 / (w1 * h1 + 1e-16) > 0.1) & (aspect_ratio < 100)
 
 
-def compute_iou(box1, box2, eps=1e-7):
-    # Returns Intersection over Union (IoU) of box1(1,4) to box2(n,4)
+def random_perspective(image, label, params, border=(0, 0)):
+    h = image.shape[0] + border[0] * 2
+    w = image.shape[1] + border[1] * 2
 
-    # Get the coordinates of bounding boxes
-    b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
-    b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
-    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
-    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+    # Center
+    center = numpy.eye(3)
+    center[0, 2] = -image.shape[1] / 2  # x translation (pixels)
+    center[1, 2] = -image.shape[0] / 2  # y translation (pixels)
 
-    # Intersection area
-    inter = (b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)).clamp(0) * \
-            (b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)).clamp(0)
+    # Perspective
+    perspective = numpy.eye(3)
 
-    # Union Area
-    union = w1 * h1 + w2 * h2 - inter + eps
+    # Rotation and Scale
+    rotate = numpy.eye(3)
+    a = random.uniform(-params['degrees'], params['degrees'])
+    s = random.uniform(1 - params['scale'], 1 + params['scale'])
+    rotate[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
 
-    # IoU
-    iou = inter / union
-    cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
-    ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
-    c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared
-    rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 + (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center dist ** 2
-    # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
-    v = (4 / math.pi ** 2) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)).pow(2)
-    with torch.no_grad():
-        alpha = v / (v - iou + (1 + eps))
-    return iou - (rho2 / c2 + v * alpha)  # CIoU
+    # Shear
+    shear = numpy.eye(3)
+    shear[0, 1] = math.tan(random.uniform(-params['shear'], params['shear']) * math.pi / 180)
+    shear[1, 0] = math.tan(random.uniform(-params['shear'], params['shear']) * math.pi / 180)
 
+    # Translation
+    translate = numpy.eye(3)
+    translate[0, 2] = random.uniform(0.5 - params['translate'], 0.5 + params['translate']) * w
+    translate[1, 2] = random.uniform(0.5 - params['translate'], 0.5 + params['translate']) * h
 
-def strip_optimizer(filename):
-    x = torch.load(filename, map_location=torch.device('cpu'))
-    x['model'].half()  # to FP16
-    for p in x['model'].parameters():
-        p.requires_grad = False
-    torch.save(x, filename)
+    # Combined rotation matrix, order of operations (right to left) is IMPORTANT
+    matrix = translate @ shear @ rotate @ perspective @ center
+    if (border[0] != 0) or (border[1] != 0) or (matrix != numpy.eye(3)).any():  # image changed
+        image = cv2.warpAffine(image, matrix[:2], dsize=(w, h), borderValue=(0, 0, 0))
 
+    # Transform label coordinates
+    n = len(label)
+    if n:
+        xy = numpy.ones((n * 4, 3))
+        xy[:, :2] = label[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
+        xy = xy @ matrix.T  # transform
+        xy = xy[:, :2].reshape(n, 8)  # perspective rescale or affine
 
-def clip_gradients(model, max_norm=10.0):
-    parameters = model.parameters()
-    torch.nn.utils.clip_grad_norm_(parameters, max_norm=max_norm)
+        # create new boxes
+        x = xy[:, [0, 2, 4, 6]]
+        y = xy[:, [1, 3, 5, 7]]
+        box = numpy.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
 
+        # clip
+        box[:, [0, 2]] = box[:, [0, 2]].clip(0, w)
+        box[:, [1, 3]] = box[:, [1, 3]].clip(0, h)
+        # filter candidates
+        indices = candidates(box1=label[:, 1:5].T * s, box2=box.T)
 
-def load_weight(ckpt, model):
-    dst = model.state_dict()
-    src = torch.load(ckpt, 'cpu')['model'].float().state_dict()
-    ckpt = {}
-    for k, v in src.items():
-        if k in dst and v.shape == dst[k].shape:
-            ckpt[k] = v
-    model.load_state_dict(state_dict=ckpt, strict=False)
-    return model
+        label = label[indices]
+        label[:, 1:5] = box[indices]
 
-
-class EMA:
-    """
-    Updated Exponential Moving Average (EMA) from https://github.com/rwightman/pytorch-image-models
-    Keeps a moving average of everything in the model state_dict (parameters and buffers)
-    For EMA details see https://www.tensorflow.org/api_docs/python/tf/train/ExponentialMovingAverage
-    """
-
-    def __init__(self, model, decay=0.9999, tau=2000, updates=0):
-        # Create EMA
-        self.ema = copy.deepcopy(model).eval()  # FP32 EMA
-        self.updates = updates  # number of EMA updates
-        # decay exponential ramp (to help early epochs)
-        self.decay = lambda x: decay * (1 - math.exp(-x / tau))
-        for p in self.ema.parameters():
-            p.requires_grad_(False)
-
-    def update(self, model):
-        if hasattr(model, 'module'):
-            model = model.module
-        # Update EMA parameters
-        with torch.no_grad():
-            self.updates += 1
-            d = self.decay(self.updates)
-
-            msd = model.state_dict()  # model state_dict
-            for k, v in self.ema.state_dict().items():
-                if v.dtype.is_floating_point:
-                    v *= d
-                    v += (1 - d) * msd[k].detach()
+    return image, label
 
 
-class AverageMeter:
+def mix_up(image1, box1, image2, box2):
+    # Applies MixUp augmentation https://arxiv.org/pdf/1710.09412.pdf
+    alpha = numpy.random.beta(32.0, 32.0)  # mix-up ratio, alpha=beta=32.0
+    image = (image1 * alpha + image2 * (1 - alpha)).astype(numpy.uint8)
+    box = numpy.concatenate((box1, box2), 0)
+    return image, box
+
+
+class Albumentations:
     def __init__(self):
-        self.num = 0
-        self.sum = 0
-        self.avg = 0
+        self.transform = None
+        try:
+            import albumentations
 
-    def update(self, v, n):
-        if not math.isnan(float(v)):
-            self.num = self.num + n
-            self.sum = self.sum + v * n
-            self.avg = self.sum / self.num
+            transforms = [albumentations.Blur(p=0.01),
+                          albumentations.CLAHE(p=0.01),
+                          albumentations.ToGray(p=0.01),
+                          albumentations.MedianBlur(p=0.01)]
+            self.transform = albumentations.Compose(transforms,
+                                                    albumentations.BboxParams('yolo', ['class_labels']))
 
+        except ImportError:  # package not installed, skip
+            pass
 
-class Assigner(torch.nn.Module):
-    def __init__(self, top_k=13, nc=80, alpha=1.0, beta=6.0, eps=1E-9):
-        super().__init__()
-        self.top_k = top_k
-        self.nc = nc
-        self.alpha = alpha
-        self.beta = beta
-        self.eps = eps
-
-    @torch.no_grad()
-    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
-        batch_size = pd_scores.size(0)
-        num_max_boxes = gt_bboxes.size(1)
-
-        if num_max_boxes == 0:
-            device = gt_bboxes.device
-            return (torch.full_like(pd_scores[..., 0], self.nc).to(device),
-                    torch.zeros_like(pd_bboxes).to(device),
-                    torch.zeros_like(pd_scores).to(device),
-                    torch.zeros_like(pd_scores[..., 0]).to(device),
-                    torch.zeros_like(pd_scores[..., 0]).to(device))
-
-        num_anchors = anc_points.shape[0]
-        shape = gt_bboxes.shape
-        lt, rb = gt_bboxes.view(-1, 1, 4).chunk(2, 2)
-        mask_in_gts = torch.cat((anc_points[None] - lt, rb - anc_points[None]), dim=2)
-        mask_in_gts = mask_in_gts.view(shape[0], shape[1], num_anchors, -1).amin(3).gt_(self.eps)
-        na = pd_bboxes.shape[-2]
-        gt_mask = (mask_in_gts * mask_gt).bool()  # b, max_num_obj, h*w
-        overlaps = torch.zeros([batch_size, num_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
-        bbox_scores = torch.zeros([batch_size, num_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
-
-        ind = torch.zeros([2, batch_size, num_max_boxes], dtype=torch.long)  # 2, b, max_num_obj
-        ind[0] = torch.arange(end=batch_size).view(-1, 1).expand(-1, num_max_boxes)  # b, max_num_obj
-        ind[1] = gt_labels.squeeze(-1)  # b, max_num_obj
-        bbox_scores[gt_mask] = pd_scores[ind[0], :, ind[1]][gt_mask]  # b, max_num_obj, h*w
-
-        pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, num_max_boxes, -1, -1)[gt_mask]
-        gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[gt_mask]
-        overlaps[gt_mask] = compute_iou(gt_boxes, pd_boxes).squeeze(-1).clamp_(0)
-
-        align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
-
-        top_k_mask = mask_gt.expand(-1, -1, self.top_k).bool()
-        top_k_metrics, top_k_indices = torch.topk(align_metric, self.top_k, dim=-1, largest=True)
-        if top_k_mask is None:
-            top_k_mask = (top_k_metrics.max(-1, keepdim=True)[0] > self.eps).expand_as(top_k_indices)
-        top_k_indices.masked_fill_(~top_k_mask, 0)
-
-        mask_top_k = torch.zeros(align_metric.shape, dtype=torch.int8, device=top_k_indices.device)
-        ones = torch.ones_like(top_k_indices[:, :, :1], dtype=torch.int8, device=top_k_indices.device)
-        for k in range(self.top_k):
-            mask_top_k.scatter_add_(-1, top_k_indices[:, :, k:k + 1], ones)
-        mask_top_k.masked_fill_(mask_top_k > 1, 0)
-        mask_top_k = mask_top_k.to(align_metric.dtype)
-        mask_pos = mask_top_k * mask_in_gts * mask_gt
-
-        fg_mask = mask_pos.sum(-2)
-        if fg_mask.max() > 1:
-            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).expand(-1, num_max_boxes, -1)
-            max_overlaps_idx = overlaps.argmax(1)
-
-            is_max_overlaps = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)
-            is_max_overlaps.scatter_(1, max_overlaps_idx.unsqueeze(1), 1)
-
-            mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos).float()
-            fg_mask = mask_pos.sum(-2)
-        target_gt_idx = mask_pos.argmax(-2)
-
-        # Assigned target
-        index = torch.arange(end=batch_size, dtype=torch.int64, device=gt_labels.device)[..., None]
-        target_index = target_gt_idx + index * num_max_boxes
-        target_labels = gt_labels.long().flatten()[target_index]
-
-        target_bboxes = gt_bboxes.view(-1, gt_bboxes.shape[-1])[target_index]
-
-        # Assigned target scores
-        target_labels.clamp_(0)
-
-        target_scores = torch.zeros((target_labels.shape[0], target_labels.shape[1], self.nc),
-                                    dtype=torch.int64,
-                                    device=target_labels.device)
-        target_scores.scatter_(2, target_labels.unsqueeze(-1), 1)
-
-        fg_scores_mask = fg_mask[:, :, None].repeat(1, 1, self.nc)
-        target_scores = torch.where(fg_scores_mask > 0, target_scores, 0)
-
-        # Normalize
-        align_metric *= mask_pos
-        pos_align_metrics = align_metric.amax(dim=-1, keepdim=True)
-        pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)
-        norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
-        target_scores = target_scores * norm_align_metric
-
-        return target_bboxes, target_scores, fg_mask.bool()
-
-
-class BoxLoss(torch.nn.Module):
-    def __init__(self, dfl_ch):
-        super().__init__()
-        self.dfl_ch = dfl_ch
-
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
-        # IoU loss
-        weight = torch.masked_select(target_scores.sum(-1), fg_mask).unsqueeze(-1)
-        iou = compute_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
-
-        # DFL loss
-        a, b = target_bboxes.chunk(2, -1)
-        target = torch.cat((anchor_points - a, b - anchor_points), -1)
-        target = target.clamp(0, self.dfl_ch - 0.01)
-        loss_dfl = self.df_loss(pred_dist[fg_mask].view(-1, self.dfl_ch + 1), target[fg_mask])
-        loss_dfl = (loss_dfl * weight).sum() / target_scores_sum
-
-        return loss_iou, loss_dfl
-
-    @staticmethod
-    def df_loss(pred_dist, target):
-        # Distribution Focal Loss (DFL)
-        # https://ieeexplore.ieee.org/document/9792391
-        tl = target.long()  # target left
-        tr = tl + 1  # target right
-        wl = tr - target  # weight left
-        wr = 1 - wl  # weight right
-        left_loss = cross_entropy(pred_dist, tl.view(-1), reduction='none').view(tl.shape)
-        right_loss = cross_entropy(pred_dist, tr.view(-1), reduction='none').view(tl.shape)
-        return (left_loss * wl + right_loss * wr).mean(-1, keepdim=True)
-
-
-class ComputeLoss:
-    def __init__(self, model, params):
-        if hasattr(model, 'module'):
-            model = model.module
-
-        device = next(model.parameters()).device
-
-        m = model.head  # Head() module
-
-        self.params = params
-        self.stride = m.stride
-        self.nc = m.nc
-        self.no = m.no
-        self.reg_max = m.ch
-        self.device = device
-
-        self.box_loss = BoxLoss(m.ch - 1).to(device)
-        self.cls_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
-        self.assigner = Assigner(top_k=10, nc=self.nc, alpha=0.5, beta=6.0)
-
-        self.project = torch.arange(m.ch, dtype=torch.float, device=device)
-
-    def box_decode(self, anchor_points, pred_dist):
-        b, a, c = pred_dist.shape
-        pred_dist = pred_dist.view(b, a, 4, c // 4)
-        pred_dist = pred_dist.softmax(3)
-        pred_dist = pred_dist.matmul(self.project.type(pred_dist.dtype))
-        lt, rb = pred_dist.chunk(2, -1)
-        x1y1 = anchor_points - lt
-        x2y2 = anchor_points + rb
-        return torch.cat((x1y1, x2y2), -1)
-
-    def __call__(self, outputs, targets):
-        loss_cls = torch.zeros(1, device=self.device)
-        loss_box = torch.zeros(1, device=self.device)
-        loss_dfl = torch.zeros(1, device=self.device)
-
-        x = torch.cat([i.view(outputs[0].shape[0], self.no, -1) for i in outputs], 2)
-        pred_distri, pred_scores = x.split((self.reg_max * 4, self.nc), 1)
-
-        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
-        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
-
-        data_type = pred_scores.dtype
-        batch_size = pred_scores.shape[0]
-        input_size = torch.tensor(outputs[0].shape[2:], device=self.device, dtype=data_type) * self.stride[0]
-        anchor_points, stride_tensor = make_anchors(outputs, self.stride, offset=0.5)
-
-        idx = targets['idx'].view(-1, 1)
-        cls = targets['cls'].view(-1, 1)
-        box = targets['box']
-
-        targets = torch.cat((idx, cls, box), dim=1).to(self.device)
-        if targets.shape[0] == 0:
-            gt = torch.zeros(batch_size, 0, 5, device=self.device)
-        else:
-            i = targets[:, 0]
-            _, counts = i.unique(return_counts=True)
-            counts = counts.to(dtype=torch.int32)
-            gt = torch.zeros(batch_size, counts.max(), 5, device=self.device)
-            for j in range(batch_size):
-                matches = i == j
-                n = matches.sum()
-                if n:
-                    gt[j, :n] = targets[matches, 1:]
-            x = gt[..., 1:5].mul_(input_size[[1, 0, 1, 0]])
-            y = torch.empty_like(x)
-            dw = x[..., 2] / 2  # half-width
-            dh = x[..., 3] / 2  # half-height
-            y[..., 0] = x[..., 0] - dw  # top left x
-            y[..., 1] = x[..., 1] - dh  # top left y
-            y[..., 2] = x[..., 0] + dw  # bottom right x
-            y[..., 3] = x[..., 1] + dh  # bottom right y
-            gt[..., 1:5] = y
-        gt_labels, gt_bboxes = gt.split((1, 4), 2)
-        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
-
-        pred_bboxes = self.box_decode(anchor_points, pred_distri)
-        assigned_targets = self.assigner(pred_scores.detach().sigmoid(),
-                                         (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-                                         anchor_points * stride_tensor, gt_labels, gt_bboxes, mask_gt)
-        target_bboxes, target_scores, fg_mask = assigned_targets
-
-        target_scores_sum = max(target_scores.sum(), 1)
-
-        loss_cls = self.cls_loss(pred_scores, target_scores.to(data_type)).sum() / target_scores_sum  # BCE
-
-        # Box loss
-        if fg_mask.sum():
-            target_bboxes /= stride_tensor
-            loss_box, loss_dfl = self.box_loss(pred_distri,
-                                               pred_bboxes,
-                                               anchor_points,
-                                               target_bboxes,
-                                               target_scores,
-                                               target_scores_sum, fg_mask)
-
-        loss_box *= self.params['box']  # box gain
-        loss_cls *= self.params['cls']  # cls gain
-        loss_dfl *= self.params['dfl']  # dfl gain
-
-        return loss_box, loss_cls, loss_dfl
+    def __call__(self, image, box, cls):
+        if self.transform:
+            x = self.transform(image=image,
+                               bboxes=box,
+                               class_labels=cls)
+            image = x['image']
+            box = numpy.array(x['bboxes'])
+            cls = numpy.array(x['class_labels'])
+        return image, box, cls
