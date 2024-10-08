@@ -25,11 +25,10 @@ class Dataset(data.Dataset):
         self.n = len(self.filenames)  # number of samples
         self.indices = range(self.n)
         # Albumentations (optional, only used if package is installed)
-        self.albumentations = Albumentations()
+        # self.albumentations = Albumentations()
 
     def __getitem__(self, index):
         index = self.indices[index]
-        print(index)
 
         params = self.params
         mosaic = self.mosaic and random.random() < params['mosaic']
@@ -53,7 +52,6 @@ class Dataset(data.Dataset):
             image, ratio, pad = resize(image, self.input_size, self.augment)
 
             label = self.labels[index].copy()
-            print(label)
             if label.size:
                 label[:, 1:] = wh2xy(label[:, 1:], ratio[0] * w, ratio[1] * h, pad[0], pad[1])
             if self.augment:
@@ -91,7 +89,6 @@ class Dataset(data.Dataset):
         # Convert HWC to CHW, BGR to RGB
         sample = image.transpose((2, 0, 1))[::-1]
         sample = numpy.ascontiguousarray(sample)
-        print(target_cls, target_box)
 
         return torch.from_numpy(sample), target_cls, target_box, torch.zeros(nl)
 
@@ -239,7 +236,7 @@ class Dataset(data.Dataset):
                 pass
             except AssertionError:
                 pass
-        # torch.save(x, path)
+        torch.save(x, path)
         return x
 
 
@@ -399,7 +396,6 @@ class Albumentations:
         self.transform = None
         try:
             import albumentations
-
             transforms = [albumentations.Blur(p=0.01),
                           albumentations.CLAHE(p=0.01),
                           albumentations.ToGray(p=0.01),
