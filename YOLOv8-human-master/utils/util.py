@@ -516,10 +516,12 @@ class ComputeLoss:
         batch_size = pred_scores.shape[0]
         input_size = torch.tensor(outputs[0].shape[2:], device=self.device, dtype=data_type) * self.stride[0]
         anchor_points, stride_tensor = make_anchors(outputs, self.stride, offset=0.5)
-
+        print("fuck")
         idx = targets['idx'].view(-1, 1)
         cls = targets['cls'].view(-1, 1)
-        box = targets['box']
+        box = targets['box'].view(-1, 4)
+        print("you")
+        print(idx.shape, cls.shape, box.shape, "this")
 
         targets = torch.cat((idx, cls, box), dim=1).to(self.device)
         if targets.shape[0] == 0:
@@ -550,9 +552,11 @@ class ComputeLoss:
         assigned_targets = self.assigner(pred_scores.detach().sigmoid(),
                                          (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
                                          anchor_points * stride_tensor, gt_labels, gt_bboxes, mask_gt)
-        target_bboxes, target_scores, fg_mask = assigned_targets
+        print(len(assigned_targets))
+        target_bboxes, target_scores, fg_mask = assigned_targets[0], assigned_targets[1], assigned_targets[2]
 
         target_scores_sum = max(target_scores.sum(), 1)
+        target_scores = target_scores[:, :, 0].unsqueeze(-1)
 
         loss_cls = self.cls_loss(pred_scores, target_scores.to(data_type)).sum() / target_scores_sum  # BCE
 
